@@ -157,6 +157,11 @@ Meetings are stored locally and can be exported to Markdown, plain text, JSON, S
 
 ## Configuration
 
+This branch also includes an optional **Chinese GTK4 control center** for model
+downloads, service controls, microphone settings, and diagnostics. See
+[Voxtype 中文工作台](contrib/gtk-control-center/README.md) for launch and installation
+instructions. It uses the installed Voxtype CLI and leaves the terminal UI available.
+
 Config file location: `~/.config/voxtype/config.toml`
 
 See [`config/default.toml`](config/default.toml) for the full annotated default configuration.
