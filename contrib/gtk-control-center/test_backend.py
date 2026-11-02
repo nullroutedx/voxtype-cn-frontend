@@ -54,6 +54,7 @@ class BackendTests(unittest.TestCase):
         self.original = b'# preserve comments\nengine = "sensevoice"\n'
         self.path.write_bytes(self.original)
         self.backend = FakeBackend(self.path)
+        self.backend.download_log = self.path.parent / "download.log"
 
     def tearDown(self):
         self.directory.cleanup()
@@ -114,6 +115,7 @@ class BackendTests(unittest.TestCase):
         executable.write_text("#!/usr/bin/python\nimport sys,time,json\nfrom pathlib import Path\n" + f"Path({str(trace)!r}).write_text(json.dumps(sys.argv))\n" + "print('{\"event\":\"progress\",\"pct\":10}',flush=True)\ntime.sleep(60)\n")
         executable.chmod(0o755)
         backend = Backend(binary=str(executable), config_path=self.path)
+        backend.download_log = self.path.parent / "download.log"
         events, errors = [], []
         def download():
             try:
@@ -133,6 +135,44 @@ class BackendTests(unittest.TestCase):
         self.assertIn("取消", errors[0])
         self.assertNotIn("--activate", json.loads(trace.read_text()))
         self.assertEqual(self.path.read_bytes(), self.original)
+
+    def test_explicit_proxy_applies_to_downloader_only(self):
+        backend = Backend(config_path=self.path)
+        with patch.dict('os.environ', {'https_proxy': 'http://old:123', 'NO_PROXY': '*'}):
+            backend.set_download_proxy('http://127.0.0.1:7897')
+            env = backend.download_environment()
+            self.assertEqual(env['https_proxy'], 'http://127.0.0.1:7897')
+            self.assertNotIn('NO_PROXY', env)
+            self.assertEqual(__import__('os').environ['https_proxy'], 'http://old:123')
+            backend.set_download_proxy('')
+            self.assertEqual(backend.download_environment()['https_proxy'], 'http://old:123')
+        self.assertEqual(self.path.read_bytes(), self.original)
+
+    def test_bad_proxy_does_not_get_saved(self):
+        for proxy in ('127.0.0.1:7897', 'http://user:secret@host:123', 'http://host:notaport', 'file:///tmp/file'):
+            with self.assertRaises(BackendError):
+                self.backend.set_download_proxy(proxy)
+        self.assertFalse(self.backend.gui_config.exists())
+
+    def test_tls_eof_retries_once_but_not_permanent_errors(self):
+        backend = Backend(config_path=self.path)
+        backend.download_log = self.path.parent / 'download.log'
+        catalog = {'engines': {'paraformer': {'models': [{'download_arg': 'paraformer-zh', 'downloadable': True}]}}}
+        error = 'curl failed with exit code 35 (stderr: curl: (35) TLS connect error: unexpected eof)'
+        events = []
+        with patch.object(backend, 'data', return_value=catalog), patch.object(backend.download_cancel, 'wait', return_value=False):
+            with patch.object(backend, '_download_once', side_effect=[(1, error), (0, '')]) as run:
+                backend.download('paraformer-zh', events.append)
+                self.assertEqual(run.call_count, 2)
+                self.assertEqual(events[0]['event'], 'retry')
+            with patch.object(backend, '_download_once', return_value=(1, error)) as run:
+                with self.assertRaisesRegex(BackendError, '加密连接中断'):
+                    backend.download('paraformer-zh', events.append)
+                self.assertEqual(run.call_count, 2)
+            with patch.object(backend, '_download_once', return_value=(1, 'curl: (22) HTTP 404')) as run:
+                with self.assertRaisesRegex(BackendError, '404'):
+                    backend.download('paraformer-zh', events.append)
+                self.assertEqual(run.call_count, 1)
 
 
 if __name__ == "__main__":

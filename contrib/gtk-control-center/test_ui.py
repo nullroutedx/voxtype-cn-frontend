@@ -36,6 +36,9 @@ class FixtureBackend:
     def data(self, *_):
         return [{"name": "default"}, {"name": "sysdefault:CARD=EarPods"}]
 
+    def set_download_proxy(self, proxy):
+        self.calls.append(('proxy', proxy))
+
 
 class UITests(unittest.TestCase):
     @classmethod
@@ -121,6 +124,15 @@ class UITests(unittest.TestCase):
         self.assertTrue(self.window.error.get_visible())
         self.assertIn("网络不可用", self.window.error.get_text())
         self.assertTrue(self.window.start_button.get_sensitive())
+
+    def test_proxy_save_is_separate_from_voice_settings(self):
+        self.window.proxy_entry.set_text('http://127.0.0.1:7897')
+        self.window.proxy_save.emit('clicked')
+        self.spin(lambda: not self.window.busy)
+        self.assertIn(('proxy', 'http://127.0.0.1:7897'), self.window.backend.calls)
+        self.assertFalse(self.window.dirty)
+        self.window.progress_event({'event': 'retry'})
+        self.assertIn('重试', self.window.operation_text.get_text())
 
 
 if __name__ == "__main__":

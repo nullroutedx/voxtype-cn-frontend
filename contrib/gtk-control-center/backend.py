@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import signal
 import subprocess
 import threading
 import time
+from urllib.parse import urlsplit
 
 
 class BackendError(RuntimeError):
@@ -21,6 +23,61 @@ class Backend:
         self.config_path = Path(config_path or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "voxtype/config.toml")
         self.lock = threading.Lock()
         self.download_cancel = threading.Event()
+        self.gui_config = self.config_path.with_name("gui.json")
+        self.download_log = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "voxtype-gui/download.log"
+
+    def get_download_proxy(self):
+        if not self.gui_config.exists():
+            return ""
+        try:
+            value = json.loads(self.gui_config.read_text()).get("download_proxy", "")
+            return self.validate_proxy(value)
+        except (ValueError, OSError, AttributeError) as exc:
+            raise BackendError("无法读取下载代理设置，请检查 gui.json。") from exc
+
+    @staticmethod
+    def validate_proxy(value):
+        if not isinstance(value, str):
+            raise BackendError("下载代理必须是一个地址")
+        value = value.strip()
+        if not value:
+            return ""
+        try:
+            parsed = urlsplit(value)
+            valid = (parsed.scheme in ("http", "https", "socks5", "socks5h")
+                     and parsed.hostname and parsed.port
+                     and not parsed.username and not parsed.password
+                     and parsed.path in ("", "/") and not parsed.query and not parsed.fragment
+                     and not any(c.isspace() for c in value))
+        except ValueError:
+            valid = False
+        if not valid:
+            raise BackendError("请输入带端口的代理地址，例如 http://127.0.0.1:7897；暂不支持带账号密码的地址。")
+        return value
+
+    def set_download_proxy(self, value):
+        value = self.validate_proxy(value)
+        with self.lock:
+            try:
+                config = json.loads(self.gui_config.read_text()) if self.gui_config.exists() else {}
+                config["download_proxy"] = value
+                self.gui_config.parent.mkdir(parents=True, exist_ok=True)
+                temporary = self.gui_config.with_suffix(".json.tmp")
+                temporary.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n")
+                temporary.chmod(0o600)
+                temporary.replace(self.gui_config)
+            except (OSError, ValueError, TypeError) as exc:
+                raise BackendError("保存下载代理设置失败") from exc
+
+    def download_environment(self):
+        env = os.environ.copy()
+        proxy = self.get_download_proxy()
+        if proxy:
+            for key in list(env):
+                if key.lower() in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+                    del env[key]
+            env.update(http_proxy=proxy, https_proxy=proxy, all_proxy=proxy)
+        return env
 
     def run(self, args, timeout=15):
         try:
@@ -55,7 +112,7 @@ class Backend:
         return service, status
 
     def snapshot(self):
-        return {"config": self.data("config", "get"), "models": self.data("info", "models"), "engines": self.data("info", "engines")}
+        return {"config": self.data("config", "get"), "models": self.data("info", "models"), "engines": self.data("info", "engines"), "download_proxy": self.get_download_proxy()}
 
     def require_idle(self):
         service, status = self.status()
@@ -137,7 +194,30 @@ class Backend:
                 self.wait_ready()
 
     def logs(self):
-        return self.run(["journalctl", "--user", "-u", "voxtype", "-n", "65", "--no-pager", "-o", "short"])
+        try:
+            service_log = self.run(["journalctl", "--user", "-u", "voxtype", "-n", "65", "--no-pager", "-o", "short"])
+        except BackendError as exc:
+            service_log = str(exc)
+        download_log = self.download_log.read_text() if self.download_log.exists() else "暂无下载记录"
+        return "=== 最近一次模型下载 ===\n" + download_log[-16000:] + "\n\n=== 识别服务 ===\n" + service_log
+
+    @staticmethod
+    def transient_download_error(message):
+        # curl normally doesn't retry TLS EOF (35), which caused the observed failure.
+        codes = re.findall(r"(?:exit(?:ed)?(?: with)? code|curl:)\s*\(?([0-9]+)", message)
+        return bool(set(codes) & {"5", "6", "7", "18", "28", "35", "52", "55", "56"})
+
+    @staticmethod
+    def explain_download_error(message):
+        if "35" in message and ("TLS" in message or "SSL" in message):
+            return "与模型服务器的加密连接中断。可在模型页填写本机代理地址，然后重新下载。"
+        if "Could not resolve" in message:
+            return "无法解析模型服务器地址。请检查网络或下载代理。"
+        if "timed out" in message.lower() or "Timeout" in message:
+            return "模型下载连接超时，请检查网络或下载代理。"
+        if "404" in message:
+            return "模型服务器没有这个文件（404）。请稍后重试或检查 Voxtype 版本。"
+        return "模型下载未完成，请打开诊断查看具体原因。"
 
     def download(self, download_arg, progress):
         """Download only. Activation is an explicit, separate operation."""
@@ -145,34 +225,60 @@ class Backend:
             allowed = {m["download_arg"] for v in self.data("info", "models")["engines"].values() for m in v["models"] if m.get("downloadable")}
             if download_arg not in allowed:
                 raise BackendError("模型不在当前版本的下载列表里")
-            with subprocess.Popen([self.binary, "--config", str(self.config_path), "setup", "--download", "--model", download_arg, "--progress-format", "json"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True) as proc:
-                finished = threading.Event()
-
-                def cancel_watch():
-                    while not finished.wait(0.2):
-                        if self.download_cancel.is_set():
-                            try:
-                                os.killpg(proc.pid, signal.SIGTERM)
-                                if not finished.wait(2):
-                                    os.killpg(proc.pid, signal.SIGKILL)
-                            except ProcessLookupError:
-                                pass
-                            return
-
-                threading.Thread(target=cancel_watch, daemon=True).start()
-                tail = []
-                try:
-                    for line in proc.stdout:
-                        tail.append(line.strip())
-                        tail = tail[-15:]
-                        try:
-                            progress(json.loads(line))
-                        except json.JSONDecodeError:
-                            pass
-                    code = proc.wait()
-                finally:
-                    finished.set()
+            env = self.download_environment()
+            self.download_log.parent.mkdir(parents=True, exist_ok=True)
+            self.download_log.write_text(f"模型：{download_arg}\n")
+            self.download_log.chmod(0o600)
+            for attempt in range(2):
                 if self.download_cancel.is_set():
                     raise BackendError("下载已取消，当前使用的模型未改变。")
-                if code:
-                    raise BackendError("下载失败，可稍后重试。\n" + "\n".join(tail))
+                code, detail = self._download_once(download_arg, progress, env)
+                if self.download_cancel.is_set():
+                    raise BackendError("下载已取消，当前使用的模型未改变。")
+                if code == 0:
+                    return
+                if attempt == 0 and self.transient_download_error(detail):
+                    progress({"event": "retry", "model": download_arg})
+                    if self.download_cancel.wait(2):
+                        raise BackendError("下载已取消，当前使用的模型未改变。")
+                    continue
+                raise BackendError(self.explain_download_error(detail) + "\n详细错误已保存在“诊断”中。")
+
+    def _download_once(self, download_arg, progress, env):
+        with subprocess.Popen([self.binary, "--config", str(self.config_path), "setup", "--download", "--model", download_arg, "--progress-format", "json"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True, env=env) as proc:
+            finished = threading.Event()
+
+            def cancel_watch():
+                while not finished.wait(0.2):
+                    if self.download_cancel.is_set():
+                        try:
+                            os.killpg(proc.pid, signal.SIGTERM)
+                            if not finished.wait(2):
+                                os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        return
+
+            threading.Thread(target=cancel_watch, daemon=True).start()
+            tail = []
+            last_error = ""
+            try:
+                for line in proc.stdout:
+                    tail.append(line.strip())
+                    tail = tail[-15:]
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        event = None
+                    if isinstance(event, dict):
+                        if event.get("event") == "error":
+                            last_error = str(event.get("message", ""))
+                        progress(event)
+                    # Progress is displayed live; keep diagnostics small and free of JSON noise.
+                    if not isinstance(event, dict) or event.get("event") in ("error", "done"):
+                        with self.download_log.open("a") as log:
+                            log.write((str(event.get("message", line.strip())) if event else line.strip()) + "\n")
+                code = proc.wait()
+            finally:
+                finished.set()
+            return code, last_error or "\n".join(tail)

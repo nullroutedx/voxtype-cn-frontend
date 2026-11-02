@@ -30,7 +30,7 @@ textview { padding: 12px; }
 
 MODELS = [
     ("sensevoice", "small", "SenseVoice Small", "中文首选", "普通话、粤语、中英夹杂。轻量量化版，适合本机 CPU。", "约 239 MB"),
-    ("paraformer", "paraformer-zh", "Paraformer 中文", "中文备选", "普通话与中英双语，可与 SenseVoice 对比实际录音效果。", "约 487 MB"),
+    ("paraformer", "paraformer-zh", "Paraformer 中文", "中文备选", "普通话与中英双语，可与 SenseVoice 对比实际录音效果。", "约 243 MB"),
     ("whisper", "base", "Whisper Base", "轻量多语言", "适合简短录音和多语言入门，速度优先。", "约 142 MB"),
     ("whisper", "small", "Whisper Small", "多语言进阶", "更大的多语言模型，识别时通常需要等待更久。", "约 466 MB"),
 ]
@@ -167,6 +167,12 @@ class Window(Adw.ApplicationWindow):
         page = self.page("models", "模型", "folder-download-symbolic")
         page.append(label("选一个适合你的声音", "page-title"))
         page.append(label("下载不会改变当前模型。下载完成后，点击“启用”才会切换。", "muted", True))
+        network = Adw.PreferencesGroup(title="下载网络", description="留空使用系统环境。代理只用于下载，例如 http://127.0.0.1:7897。")
+        self.proxy_entry = Adw.EntryRow(title="代理地址（可选）")
+        self.proxy_save = button("保存", lambda _: self.save_download_proxy())
+        self.proxy_entry.add_suffix(self.proxy_save)
+        network.add(self.proxy_entry)
+        page.append(network)
         self.model_box = box(14)
         page.append(self.model_box)
         page.append(label("这里只展示中文常用模型；其他模型仍可通过原版命令行管理。下载大小为近似值。", "muted", True))
@@ -321,11 +327,21 @@ class Window(Adw.ApplicationWindow):
             return
         self.task("正在切换模型并等待服务就绪…", lambda: self.backend.activate(engine, model), lambda _: self.saved())
 
+    def save_download_proxy(self):
+        proxy = self.proxy_entry.get_text()
+        self.task("正在保存下载网络设置…", lambda: self.backend.set_download_proxy(proxy), lambda _: self.toast.add_toast(Adw.Toast(title="下载网络设置已保存")))
+
     def download_model(self, arg):
+        if self.busy:
+            return
         self.is_downloading = True
         self.backend.download_cancel.clear()
         self.cancel_button.set_visible(True)
-        self.task("正在下载模型，完成后可点击启用…", lambda: self.backend.download(arg, self.download_progress), lambda _: self.download_done())
+        proxy = self.proxy_entry.get_text()
+        def download():
+            self.backend.set_download_proxy(proxy)
+            self.backend.download(arg, self.download_progress)
+        self.task("正在连接模型服务器…", download, lambda _: self.download_done())
 
     def download_progress(self, event):
         GLib.idle_add(self.progress_event, event)
@@ -339,6 +355,9 @@ class Window(Adw.ApplicationWindow):
             self.progress.pulse()
         if event.get("event") == "error":
             self.operation_text.set_text("下载遇到问题，正在等待退出…")
+        elif event.get("event") == "retry":
+            self.operation_text.set_text("网络连接中断，正在自动重试一次…")
+            self.progress.set_fraction(0)
         return False
 
     def download_done(self):
@@ -355,7 +374,7 @@ class Window(Adw.ApplicationWindow):
     def set_busy(self, busy):
         self.busy = busy
         self.operation.set_visible(busy)
-        for control in [self.start_button, self.stop_button, self.startup_button, self.refresh_models_button, self.settings_group, *self.model_controls]:
+        for control in [self.start_button, self.stop_button, self.startup_button, self.refresh_models_button, self.settings_group, self.proxy_entry, *self.model_controls]:
             control.set_sensitive(not busy)
         self.settings_group.set_sensitive(not busy and self.snapshot_data is not None)
         self.save_button.set_sensitive(not busy and self.dirty)
@@ -397,6 +416,7 @@ class Window(Adw.ApplicationWindow):
     def refresh_snapshot(self):
         def ready(snapshot):
             self.snapshot_data = snapshot
+            self.proxy_entry.set_text(snapshot.get("download_proxy", ""))
             self.render_models()
             if not self.dirty:
                 self.load_settings()
@@ -448,7 +468,7 @@ class Window(Adw.ApplicationWindow):
             dialog = Adw.Window(transient_for=self, modal=True, title="诊断日志", default_width=780, default_height=520)
             content = box(0)
             content.append(Adw.HeaderBar())
-            hint = label("这是最近 65 条日志的快照，不会自动滚动。", "muted")
+            hint = label("最近一次下载记录与 65 条服务日志，不会自动滚动。", "muted")
             hint.set_margin_top(12)
             hint.set_margin_bottom(12)
             hint.set_margin_start(16)
